@@ -4,8 +4,11 @@ import yaml
 from loguru import logger
 from pathlib import Path
 from typing import Any, Dict
+from opentelemetry import trace
 
 from agent_base import BaseAgent
+
+tracer = trace.get_tracer(__name__)
 
 
 class WritingAgent(BaseAgent):
@@ -77,26 +80,40 @@ class WritingAgent(BaseAgent):
             f"{analysis}"
         )
 
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.bedrock_client.converse,
-                    modelId=model_id,
-                    system=[{"text": self.SYSTEM_PROMPT}],
-                    messages=[{"role": "user", "content": [{"text": prompt}]}],
-                ),
-                timeout=bedrock_timeout_s,
-            )
-            document = response["output"]["message"]["content"][0]["text"]
-            logger.info("WritingAgent: document drafted.")
-            return {"status": "success", "document": document}
-        except asyncio.TimeoutError:
-            msg = f"WritingAgent: Bedrock converse timed out after {bedrock_timeout_s:.0f}s"
-            logger.error(msg)
-            return {"status": "error", "message": msg}
-        except Exception as e:
-            logger.error(f"WritingAgent: Bedrock error: {e}")
-            return {"status": "error", "message": str(e)}
+        with tracer.start_as_current_span("agent.writing.handle") as span:
+            span.set_attribute("mas.agent.name", "writing_agent")
+            span.set_attribute("gen_ai.system", "aws.bedrock")
+            span.set_attribute("gen_ai.request.model", model_id)
+            span.set_attribute("mas.format", doc_format)
+            span.set_attribute("mas.tone", tone)
+
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.bedrock_client.converse,
+                        modelId=model_id,
+                        system=[{"text": self.SYSTEM_PROMPT}],
+                        messages=[{"role": "user", "content": [{"text": prompt}]}],
+                    ),
+                    timeout=bedrock_timeout_s,
+                )
+                usage = response.get("usage", {}) or {}
+                if "inputTokens" in usage:
+                    span.set_attribute("gen_ai.usage.input_tokens", usage["inputTokens"])
+                if "outputTokens" in usage:
+                    span.set_attribute("gen_ai.usage.output_tokens", usage["outputTokens"])
+                document = response["output"]["message"]["content"][0]["text"]
+                logger.info("WritingAgent: document drafted.")
+                return {"status": "success", "document": document}
+            except asyncio.TimeoutError:
+                msg = f"WritingAgent: Bedrock converse timed out after {bedrock_timeout_s:.0f}s"
+                logger.error(msg)
+                span.set_attribute("mas.status", "timeout")
+                return {"status": "error", "message": msg}
+            except Exception as e:
+                logger.error(f"WritingAgent: Bedrock error: {e}")
+                span.record_exception(e)
+                return {"status": "error", "message": str(e)}
 
     async def shutdown(self) -> None:
         """No persistent resources to release (stateless agent)."""

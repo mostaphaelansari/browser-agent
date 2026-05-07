@@ -4,8 +4,11 @@ from loguru import logger
 import yaml
 from pathlib import Path
 from contextlib import suppress
+from opentelemetry import trace
 
 from agent_base import BaseAgent
+
+tracer = trace.get_tracer(__name__)
 
 
 class BrowserAgent(BaseAgent):
@@ -46,42 +49,50 @@ class BrowserAgent(BaseAgent):
         action = request.get("action")
         logger.info(f"BrowserAgent received action: {action}")
 
-        try:
-            await self._ensure_browser()
+        with tracer.start_as_current_span("agent.browser.handle") as span:
+            span.set_attribute("mas.agent.name", "browser_agent")
+            span.set_attribute("mas.tool.action", action or "unknown")
 
-            if action == "navigate":
-                url = request.get("url")
-                if not url:
-                    return {"error": "Missing URL parameter"}
-                await self.page.goto(url, wait_until="domcontentloaded")
-                title = await self.page.title()
-                return {"status": "success", "title": title, "url": self.page.url}
+            try:
+                await self._ensure_browser()
 
-            elif action == "click":
-                selector = request.get("selector")
-                if not selector:
-                    return {"error": "Missing selector parameter"}
-                await self.page.click(selector)
-                return {"status": "success", "message": f"Clicked {selector}"}
+                if action == "navigate":
+                    url = request.get("url")
+                    if not url:
+                        return {"error": "Missing URL parameter"}
+                    span.set_attribute("url", url)
+                    await self.page.goto(url, wait_until="domcontentloaded")
+                    title = await self.page.title()
+                    span.set_attribute("page.title", title)
+                    return {"status": "success", "title": title, "url": self.page.url}
 
-            elif action == "extract":
-                selector = request.get("selector")
-                if not selector:
-                    return {"error": "Missing selector parameter"}
-                text = await self.page.locator(selector).inner_text()
-                return {"status": "success", "text": text}
+                elif action == "click":
+                    selector = request.get("selector")
+                    if not selector:
+                        return {"error": "Missing selector parameter"}
+                    await self.page.click(selector)
+                    return {"status": "success", "message": f"Clicked {selector}"}
 
-            elif action == "screenshot":
-                path = request.get("path", "screenshot.png")
-                await self.page.screenshot(path=path)
-                return {"status": "success", "path": path}
+                elif action == "extract":
+                    selector = request.get("selector")
+                    if not selector:
+                        return {"error": "Missing selector parameter"}
+                    text = await self.page.locator(selector).inner_text()
+                    span.set_attribute("extract.length", len(text))
+                    return {"status": "success", "text": text}
 
-            else:
-                return {"error": f"Unknown action: {action}"}
+                elif action == "screenshot":
+                    path = request.get("path", "screenshot.png")
+                    await self.page.screenshot(path=path)
+                    return {"status": "success", "path": path}
 
-        except Exception as e:
-            logger.error(f"Browser action '{action}' failed: {e}")
-            return {"status": "error", "message": str(e)}
+                else:
+                    return {"error": f"Unknown action: {action}"}
+
+            except Exception as e:
+                logger.error(f"Browser action '{action}' failed: {e}")
+                span.record_exception(e)
+                return {"status": "error", "message": str(e)}
 
     async def shutdown(self) -> None:
         # Idempotent: called per-request after each invocation, and again at app shutdown.

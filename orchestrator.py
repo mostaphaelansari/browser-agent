@@ -7,17 +7,26 @@ from loguru import logger
 from pathlib import Path
 from contextlib import asynccontextmanager, AsyncExitStack
 from dotenv import load_dotenv
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from mcp.client.stdio import stdio_client, StdioServerParameters
-from mcp.client.session import ClientSession
 
 # Load environment variables from .env file
 load_dotenv()
+
+# OTel must be configured before BedrockAgentCoreApp is constructed so its
+# BaggageSpanProcessor attaches to our provider (and before any boto3 client
+# is created so BotocoreInstrumentor can patch it).
+from tracing import setup_tracing, instrument_asgi_app, get_tracer
+setup_tracing(service_name="browser-agent-mas")
+
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.session import ClientSession
 
 from agent_base import BaseAgent
 from browser_agent import BrowserAgent
 from analysis_agent import AnalysisAgent
 from writing_agent import WritingAgent
+
+tracer = get_tracer(__name__)
 
 # System prompt that enforces the Browser → Analyse → Rédige pipeline order.
 ORCHESTRATOR_SYSTEM_PROMPT = (
@@ -272,100 +281,126 @@ class Orchestrator(BaseAgent):
         tool_config = self._get_tool_config()
 
         for loop_count in range(max_turns):
-            logger.info(f"Turn {loop_count + 1}/{max_turns} — Calling Bedrock Orchestrator...")
-            try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.bedrock_client.converse,
-                        modelId=model_id,
-                        system=[{"text": ORCHESTRATOR_SYSTEM_PROMPT}],
-                        messages=messages,
-                        toolConfig=tool_config,
-                    ),
-                    timeout=bedrock_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                msg = f"Bedrock converse timed out after {bedrock_timeout_s:.0f}s"
-                logger.error(msg)
-                return {"status": "error", "message": msg}
-            except Exception as e:
-                logger.error(f"Bedrock API error: {e}")
-                return {"status": "error", "message": str(e)}
+            with tracer.start_as_current_span("mas.react.turn") as turn_span:
+                turn_span.set_attribute("mas.turn", loop_count + 1)
+                turn_span.set_attribute("mas.turn.max", max_turns)
+                logger.info(f"Turn {loop_count + 1}/{max_turns} — Calling Bedrock Orchestrator...")
+                try:
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.bedrock_client.converse,
+                            modelId=model_id,
+                            system=[{"text": ORCHESTRATOR_SYSTEM_PROMPT}],
+                            messages=messages,
+                            toolConfig=tool_config,
+                        ),
+                        timeout=bedrock_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    msg = f"Bedrock converse timed out after {bedrock_timeout_s:.0f}s"
+                    logger.error(msg)
+                    turn_span.set_attribute("mas.status", "timeout")
+                    return {"status": "error", "message": msg}
+                except Exception as e:
+                    logger.error(f"Bedrock API error: {e}")
+                    turn_span.set_attribute("mas.status", "error")
+                    turn_span.record_exception(e)
+                    return {"status": "error", "message": str(e)}
 
-            output_message = response["output"]["message"]
-            messages.append(output_message)
+                # GenAI semantic conventions: emit token usage for cost / dashboarding.
+                usage = response.get("usage", {}) or {}
+                if "inputTokens" in usage:
+                    turn_span.set_attribute("gen_ai.usage.input_tokens", usage["inputTokens"])
+                if "outputTokens" in usage:
+                    turn_span.set_attribute("gen_ai.usage.output_tokens", usage["outputTokens"])
+                turn_span.set_attribute("gen_ai.system", "aws.bedrock")
+                turn_span.set_attribute("gen_ai.request.model", model_id)
 
-            stop_reason = response.get("stopReason")
-            if stop_reason == "tool_use":
-                tool_results = []
-                for content_block in output_message["content"]:
-                    if "toolUse" not in content_block:
-                        continue
+                output_message = response["output"]["message"]
+                messages.append(output_message)
 
-                    tool_use = content_block["toolUse"]
-                    tool_name = tool_use["name"]
-                    tool_input = tool_use["input"]
-                    tool_use_id = tool_use["toolUseId"]
+                stop_reason = response.get("stopReason")
+                turn_span.set_attribute("mas.stop_reason", stop_reason or "unknown")
 
-                    logger.info(f"Tool call: {tool_name} | input: {json.dumps(tool_input)[:200]}")
+                if stop_reason == "tool_use":
+                    tool_results = []
+                    for content_block in output_message["content"]:
+                        if "toolUse" not in content_block:
+                            continue
 
-                    # ── Agent A: Browser ─────────────────────────────────────
-                    if tool_name == "browser_action":
-                        result = await self.browser_agent.handle(tool_input)
-                        # Scrub any text fields to prevent prompt injection
-                        if result.get("status") == "success":
-                            for field in ("text", "title"):
-                                if field in result:
-                                    result[field] = self._scrub_content(str(result[field]))
+                        tool_use = content_block["toolUse"]
+                        tool_name = tool_use["name"]
+                        tool_input = tool_use["input"]
+                        tool_use_id = tool_use["toolUseId"]
 
-                    # ── Agent B: Analysis ────────────────────────────────────
-                    elif tool_name == "analysis_action":
-                        if not tool_input.get("content", "").strip():
-                            result = {"status": "error", "message": "analysis_action: 'content' is empty — did browser_action succeed?"}
-                        else:
-                            result = await self.analysis_agent.handle(tool_input)
+                        logger.info(f"Tool call: {tool_name} | input: {json.dumps(tool_input)[:200]}")
 
-                    # ── Agent D: Writing ─────────────────────────────────────
-                    elif tool_name == "writing_action":
-                        if not tool_input.get("analysis", "").strip():
-                            result = {"status": "error", "message": "writing_action: 'analysis' is empty — did analysis_action succeed?"}
-                        else:
-                            result = await self.writing_agent.handle(tool_input)
+                        with tracer.start_as_current_span("mas.tool_dispatch") as dispatch_span:
+                            dispatch_span.set_attribute("mas.tool.name", tool_name)
+                            dispatch_span.set_attribute("mas.tool.use_id", tool_use_id)
+                            sub_action = tool_input.get("action")
+                            if sub_action:
+                                dispatch_span.set_attribute("mas.tool.action", sub_action)
 
-                    # ── MCP Tools ────────────────────────────────────────────
-                    elif tool_name in self.mcp_tool_map:
-                        server_name = self.mcp_tool_map[tool_name]
-                        session = self.mcp_sessions[server_name]
-                        try:
-                            mcp_result = await session.call_tool(tool_name, tool_input)
-                            result = {"status": "success", "content": [c.model_dump() for c in mcp_result.content]}
-                            if mcp_result.isError:
-                                result["status"] = "error"
-                        except Exception as e:
-                            result = {"status": "error", "message": str(e)}
+                            # ── Agent A: Browser ─────────────────────────────────────
+                            if tool_name == "browser_action":
+                                result = await self.browser_agent.handle(tool_input)
+                                # Scrub any text fields to prevent prompt injection
+                                if result.get("status") == "success":
+                                    for field in ("text", "title"):
+                                        if field in result:
+                                            result[field] = self._scrub_content(str(result[field]))
 
-                    else:
-                        result = {"status": "error", "message": f"Unknown tool: {tool_name}"}
+                            # ── Agent B: Analysis ────────────────────────────────────
+                            elif tool_name == "analysis_action":
+                                if not tool_input.get("content", "").strip():
+                                    result = {"status": "error", "message": "analysis_action: 'content' is empty — did browser_action succeed?"}
+                                else:
+                                    result = await self.analysis_agent.handle(tool_input)
 
-                    tool_results.append({
-                        "toolResult": {
-                            "toolUseId": tool_use_id,
-                            "content": [{"json": result}],
-                        }
-                    })
+                            # ── Agent D: Writing ─────────────────────────────────────
+                            elif tool_name == "writing_action":
+                                if not tool_input.get("analysis", "").strip():
+                                    result = {"status": "error", "message": "writing_action: 'analysis' is empty — did analysis_action succeed?"}
+                                else:
+                                    result = await self.writing_agent.handle(tool_input)
 
-                messages.append({"role": "user", "content": tool_results})
+                            # ── MCP Tools ────────────────────────────────────────────
+                            elif tool_name in self.mcp_tool_map:
+                                server_name = self.mcp_tool_map[tool_name]
+                                session = self.mcp_sessions[server_name]
+                                try:
+                                    mcp_result = await session.call_tool(tool_name, tool_input)
+                                    result = {"status": "success", "content": [c.model_dump() for c in mcp_result.content]}
+                                    if mcp_result.isError:
+                                        result["status"] = "error"
+                                except Exception as e:
+                                    result = {"status": "error", "message": str(e)}
 
-            else:
-                # Model finished reasoning — extract final text
-                final_text = next(
-                    (block["text"] for block in output_message["content"] if "text" in block), ""
-                )
-                # Some models may wrap output in <thinking>/<response>. Strip to user-facing response.
-                if "<response>" in final_text and "</response>" in final_text:
-                    final_text = final_text.split("<response>", 1)[1].split("</response>", 1)[0].strip()
-                logger.info("Task completed successfully.")
-                return {"status": "success", "response": final_text}
+                            else:
+                                result = {"status": "error", "message": f"Unknown tool: {tool_name}"}
+
+                            dispatch_span.set_attribute("mas.tool.status", result.get("status", "unknown"))
+
+                        tool_results.append({
+                            "toolResult": {
+                                "toolUseId": tool_use_id,
+                                "content": [{"json": result}],
+                            }
+                        })
+
+                    messages.append({"role": "user", "content": tool_results})
+
+                else:
+                    # Model finished reasoning — extract final text
+                    final_text = next(
+                        (block["text"] for block in output_message["content"] if "text" in block), ""
+                    )
+                    # Some models may wrap output in <thinking>/<response>. Strip to user-facing response.
+                    if "<response>" in final_text and "</response>" in final_text:
+                        final_text = final_text.split("<response>", 1)[1].split("</response>", 1)[0].strip()
+                    logger.info("Task completed successfully.")
+                    return {"status": "success", "response": final_text}
 
         return {"status": "error", "message": f"Max turns ({max_turns}) reached without completing the task."}
 
@@ -390,19 +425,27 @@ async def lifespan(app):
 
 
 app = BedrockAgentCoreApp(lifespan=lifespan)
+instrument_asgi_app(app)
 
 
 @app.entrypoint
 async def invoke(payload: dict) -> dict:
     """Main entrypoint called by AgentCore for every incoming request."""
     task = payload.get("prompt") or payload.get("task", "")
-    try:
-        return await orch.handle({"task": task})
-    finally:
-        # AgentCore creates a new event loop per request; Playwright objects
-        # bound to a previous request's loop hang silently. Tear down the
-        # browser here so the next request starts fresh on its own loop.
-        await orch.browser_agent.shutdown()
+    with tracer.start_as_current_span("mas.invocation") as span:
+        span.set_attribute("mas.task.length", len(task))
+        try:
+            result = await orch.handle({"task": task})
+            span.set_attribute("mas.status", result.get("status", "unknown"))
+            response_text = result.get("response", "")
+            if response_text:
+                span.set_attribute("mas.response.length", len(response_text))
+            return result
+        finally:
+            # AgentCore creates a new event loop per request; Playwright objects
+            # bound to a previous request's loop hang silently. Tear down the
+            # browser here so the next request starts fresh on its own loop.
+            await orch.browser_agent.shutdown()
 
 
 if __name__ == "__main__":
