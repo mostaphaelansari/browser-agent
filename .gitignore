@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-local
+.claude/
+out.txt
+test.db
+rapport.md
+aws/
+test_mcp.py
