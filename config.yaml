@@ -1,0 +1,6 @@
+region: us-east-1
+model_id: anthropic.claude-v2
+aws_profile: default
+headless: true
+browser_timeout: 30
+log_group: /aws/bedrock/agent

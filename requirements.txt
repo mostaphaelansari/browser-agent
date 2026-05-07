@@ -1,0 +1,4 @@
+boto3>=1.34.0
+playwright>=1.42.0
+pyyaml>=6.0.1
+loguru>=0.7.2
