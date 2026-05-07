@@ -1,6 +1,32 @@
 region: eu-central-1
-model_id: anthropic.claude-3-sonnet-20240229-v1:0
+model_id: eu.amazon.nova-lite-v1:0
 aws_profile: default
 headless: true
 browser_timeout: 30
 log_group: /aws/bedrock/agent
+max_turns: 15
+
+# Stateless mode disables MCP servers (no persistent memory/state)
+memory:
+  mode: stateless
+
+# Optional: set guardrail_id to enable Bedrock Guardrails on scraped web content
+# This protects against prompt injection attacks from malicious web pages.
+guardrail_id: ""
+guardrail_version: "DRAFT"
+
+analysis_agent:
+  model_id: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+
+writing_agent:
+  model_id: eu.anthropic.claude-sonnet-4-6
+  default_format: markdown
+  default_tone: professional
+
+# Safety timeouts (server-side). Prevents /invocations from hanging indefinitely.
+bedrock_timeout_s: 60
+
+mcp_servers:
+  sqlite:
+    command: "uvx"
+    args: ["mcp-server-sqlite", "--db-path", "./test.db"]
